@@ -48,6 +48,8 @@
 #import <Foundation/Foundation.h>
 #import <IOBluetooth/IOBluetooth.h>
 #import <CoreBluetooth/CoreBluetooth.h>
+#import <IOKit/IOCFUnserialize.h>
+#import <IOKit/IOCFSerialize.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <signal.h>
@@ -193,6 +195,41 @@ static NSArray *wireFields(NSData *data) {
     }return fields;
 }
 static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24;}
+// Sensor descriptors use either a plist or IOKit binary serialization.
+// Read only the advertised service name, never infer one from arbitrary bytes.
+static NSString *sensorServiceName(NSData *data) {
+    if(!data.length || data.length>8192) return nil;
+    id plist=[NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:nil error:nil];
+    if(!plist) {
+        CFTypeRef decoded=IOCFUnserializeWithSize(data.bytes,data.length,kCFAllocatorDefault,0,NULL);
+        if(decoded) plist=CFBridgingRelease(decoded);
+    }
+    id name=[plist isKindOfClass:NSDictionary.class] ? plist[@"AccessoryService"]:nil;
+    return [name isKindOfClass:NSString.class] ? name:nil;
+}
+typedef struct {
+    uint64_t stamp;
+    int32_t accel[3],gyro[3];
+} DevMotion56Sample;
+static int16_t signed16(const uint8_t *p) {return (int16_t)((uint16_t)p[0] | (uint16_t)p[1]<<8);}
+// Pro 2 USB-C / firmware 9A348: report ID 1, motion layout 6, 56 bytes.
+// Verified against the local in-case capture: timestamp ns at 1, angular
+// velocity Q9 rad/s at 26, acceleration Q10 g at 44. The latter's median
+// stationary magnitude is 1024; gyro matches the Q15 attitude derivative.
+// Convert to the existing raw pipeline's microseconds and 1e-5 g / deg/s.
+static BOOL decodeDevMotion56(NSData *report,DevMotion56Sample *sample) {
+    if(report.length!=56 || !sample) return NO;
+    const uint8_t *r=report.bytes;
+    if(r[0]!=1 || r[9]!=6 || (r[11]&3)!=3) return NO;
+    uint64_t nanos=le32(r+1) | (uint64_t)le32(r+5)<<32;
+    if(nanos<1000) return NO;
+    sample->stamp=nanos/1000;
+    for(unsigned i=0;i<3;i++) {
+        sample->accel[i]=(int32_t)llround(signed16(r+44+2*i)*(100000.0/1024.0));
+        sample->gyro[i]=(int32_t)llround(signed16(r+26+2*i)*(100000.0*180.0/(512.0*M_PI)));
+    }
+    return YES;
+}
 @interface ConsoleReader : NSObject <NSStreamDelegate>
 @property(nonatomic,assign) FILE *motionStream;
 @property BOOL motionStreamFailed;
@@ -203,9 +240,39 @@ static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<
 @property NSString *phase;
 @property NSMutableDictionary *lastSamples;
 @property NSUInteger accelReports,gyroReports,accelFresh,gyroFresh;
+@property NSInteger discoveredMotionService;
+@property BOOL usingDevMotion;
+- (void)discoverSensorServices:(uint32_t)descriptor payload:(NSData *)payload;
+- (void)recordService:(unsigned)service stamp:(uint64_t)stamp x:(int32_t)x y:(int32_t)y z:(int32_t)z host:(double)host;
 @end
 @implementation ConsoleReader
-- (instancetype)init { if ((self = [super init])) { self.buffer = NSMutableData.data; self.uarpMessages = NSMutableArray.array;self.earbudStateEvents=NSMutableArray.array;self.lastSamples=NSMutableDictionary.dictionary;self.phase=@"open_baseline"; } return self; }
+- (instancetype)init { if ((self = [super init])) { self.buffer = NSMutableData.data; self.uarpMessages = NSMutableArray.array;self.earbudStateEvents=NSMutableArray.array;self.lastSamples=NSMutableDictionary.dictionary;self.phase=@"open_baseline";self.discoveredMotionService=-1; } return self; }
+- (void)discoverSensorServices:(uint32_t)descriptor payload:(NSData *)payload {
+    if(descriptor!=0x100000) return;
+    for(NSDictionary *field in wireFields(payload)) {
+        if([field[@"number"] unsignedIntValue]!=5 || !field[@"bytes"]) continue;
+        NSNumber *service=nil;NSData *description=nil;
+        for(NSDictionary *item in wireFields(field[@"bytes"])) {
+            if([item[@"number"] unsignedIntValue]==1) service=item[@"value"];
+            if([item[@"number"] unsignedIntValue]==2) description=item[@"bytes"];
+        }
+        // sensorSetting encodes the service ID as one protobuf varint byte.
+        if(service && service.unsignedLongLongValue<=127 &&
+           [sensorServiceName(description) isEqualToString:@"devmotion6"])
+            self.discoveredMotionService=service.integerValue;
+    }
+}
+- (void)recordService:(unsigned)service stamp:(uint64_t)stamp x:(int32_t)x y:(int32_t)y z:(int32_t)z host:(double)host {
+    NSString *key=[NSString stringWithFormat:@"%u",service];
+    NSDictionary *previous=self.lastSamples[key];
+    BOOL fresh=!previous || stamp>[previous[@"sensor_us"] unsignedLongLongValue];
+    NSDictionary *row=@{@"sensor_us":@(stamp),@"received_uptime":@(host),@"x":@(x),@"y":@(y),@"z":@(z)};
+    if(fresh) self.lastSamples[key]=row;
+    if(service==11) {self.accelReports++;if(fresh) self.accelFresh++;}
+    else {self.gyroReports++;if(fresh) self.gyroFresh++;}
+    NSUInteger sequence=self.accelReports+self.gyroReports;
+    if(fresh && self.motionStream && fprintf(self.motionStream,"%lu,%u,%llu,%.9f,%d,%d,%d\n",(unsigned long)sequence,service,(unsigned long long)stamp,host,x,y,z)<0) self.motionStreamFailed=YES;
+}
 - (void)stream:(NSStream *)stream handleEvent:(NSStreamEvent)event {
     if (event == NSStreamEventErrorOccurred) {
         printf("Input stream error code=%ld\n", (long)stream.streamError.code); return;
@@ -269,26 +336,28 @@ static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<
                 uint32_t descriptor = b[i+6] | b[i+7]<<8 | b[i+8]<<16 | (uint32_t)b[i+9]<<24;
                 NSUInteger size = b[i+10] | b[i+11]<<8;
                 if (i + 12 + size > count) break;
+                NSData *payload=[NSData dataWithBytes:b+i+12 length:size];
+                [self discoverSensorServices:descriptor payload:payload];
                 if(descriptor==0x100000) {
-                    NSData *payload=[NSData dataWithBytes:b+i+12 length:size];
                     for(NSDictionary *outer in wireFields(payload)) if([outer[@"number"] unsignedIntValue]==7 && outer[@"bytes"]) {
                         NSNumber *service=nil;NSData *report=nil;
                         for(NSDictionary *field in wireFields(outer[@"bytes"])) {
                             if([field[@"number"] unsignedIntValue]==1) service=field[@"value"];
                             if([field[@"number"] unsignedIntValue]==3) report=field[@"bytes"];
                         }
-                        if(([service unsignedIntValue]==11 || [service unsignedIntValue]==12) && report.length==28) {
+                        if(service && service.integerValue==self.discoveredMotionService) {
+                            DevMotion56Sample sample;
+                            if((self.usingDevMotion || (!self.accelReports && !self.gyroReports)) && decodeDevMotion56(report,&sample)) {
+                                double host=NSProcessInfo.processInfo.systemUptime;
+                                if(!self.usingDevMotion) puts("MOTION MODE devmotion6 layout=6 bytes=56; converted to existing accel/gyro units");
+                                self.usingDevMotion=YES;
+                                [self recordService:11 stamp:sample.stamp x:sample.accel[0] y:sample.accel[1] z:sample.accel[2] host:host];
+                                [self recordService:12 stamp:sample.stamp x:sample.gyro[0] y:sample.gyro[1] z:sample.gyro[2] host:host];
+                            }
+                        } else if(!self.usingDevMotion && ([service unsignedIntValue]==11 || [service unsignedIntValue]==12) && report.length==28) {
                             const uint8_t *r=report.bytes;uint64_t stamp=le32(r+20) | (uint64_t)le32(r+24)<<32;
                             if(r[0]==1 && stamp>0) {
-                                NSDictionary *previous=self.lastSamples[service.stringValue];
-                                BOOL fresh=!previous || stamp>[previous[@"sensor_us"] unsignedLongLongValue];
-                                NSDictionary *row=@{@"sensor_us":@(stamp),@"received_uptime":@(NSProcessInfo.processInfo.systemUptime),
-                                    @"x":@((int32_t)le32(r+1)),@"y":@((int32_t)le32(r+5)),@"z":@((int32_t)le32(r+9))};
-                                if(fresh) self.lastSamples[service.stringValue]=row;
-                                if(service.unsignedIntValue==11){self.accelReports++;if(fresh)self.accelFresh++;}
-                                else{self.gyroReports++;if(fresh)self.gyroFresh++;}
-                                NSUInteger sequence=self.accelReports+self.gyroReports;
-                                if(fresh && self.motionStream && fprintf(self.motionStream,"%lu,%u,%llu,%.9f,%d,%d,%d\n",(unsigned long)sequence,service.unsignedIntValue,(unsigned long long)stamp,[row[@"received_uptime"] doubleValue],[row[@"x"] intValue],[row[@"y"] intValue],[row[@"z"] intValue])<0) self.motionStreamFailed=YES;
+                                [self recordService:service.unsignedIntValue stamp:stamp x:(int32_t)le32(r+1) y:(int32_t)le32(r+5) z:(int32_t)le32(r+9) host:NSProcessInfo.processInfo.systemUptime];
                             }
                         }
                     }
@@ -407,7 +476,8 @@ static BOOL earbudModelMatches(NSString *name) {
 }
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+    return ([folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"]) ||
+           [folded isEqualToString:@"magsafe charging case (usb-c)"];
 }
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
@@ -705,7 +775,7 @@ static NSData *varintData(uint32_t value) {
 static NSString *sensorSequencePath=nil;
 // Set only when the file couldn't be written, so one session never repeats a number.
 static unsigned unsavedSensorSequence=0;
-static NSData *sensorSetting(uint8_t service,uint32_t interval) {
+static unsigned nextSensorSequence(void) {
     NSString *path=sensorSequencePath;
     NSString *saved=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     unsigned sequence=unsavedSensorSequence?:[saved intValue];
@@ -713,11 +783,26 @@ static NSData *sensorSetting(uint8_t service,uint32_t interval) {
     BOOL written=[[NSString stringWithFormat:@"%u",sequence] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     unsavedSensorSequence=written?0:sequence;
     if(!written) printf("sensor sequence not saved\n");
+    return sequence;
+}
+static NSData *sensorEnvelope(NSData *message) {
+    uint16_t n=message.length;uint8_t header[]={4,0,4,0,0x17,0,0,0,0x10,0,(uint8_t)n,(uint8_t)(n>>8)};
+    NSMutableData *data=[NSMutableData dataWithBytes:header length:sizeof(header)];[data appendData:message];return data;
+}
+static NSData *sensorDescriptorRequest(void) {
+    // SensorDataWX.request_all_descriptors (field 4): a read-only inventory,
+    // documented in pabloaul/apple-wireshark/plugins/rtbuddy/rtbuddy.proto.
+    uint8_t tag=8;NSMutableData *message=[NSMutableData dataWithBytes:&tag length:1];
+    [message appendData:varintData(nextSensorSequence())];
+    uint8_t request[]={0x22,0};[message appendBytes:request length:sizeof(request)];
+    return sensorEnvelope(message);
+}
+static NSData *sensorSetting(uint8_t service,uint32_t interval) {
+    unsigned sequence=nextSensorSequence();
     uint8_t setting[]={8,service,16,2,26,5,1,(uint8_t)interval,(uint8_t)(interval>>8),(uint8_t)(interval>>16),(uint8_t)(interval>>24)};
     uint8_t tag=8;NSMutableData *message=[NSMutableData dataWithBytes:&tag length:1];[message appendData:varintData(sequence)];
     uint8_t field[]={66,sizeof(setting)};[message appendBytes:field length:sizeof(field)];[message appendBytes:setting length:sizeof(setting)];
-    uint16_t n=message.length;uint8_t header[]={4,0,4,0,0x17,0,0,0,0x10,0,(uint8_t)n,(uint8_t)(n>>8)};
-    NSMutableData *data=[NSMutableData dataWithBytes:header length:sizeof(header)];[data appendData:message];return data;
+    return sensorEnvelope(message);
 }
 static NSArray *sensorStatus(ConsoleReader *reader,double now) {
     NSMutableArray *sensors=NSMutableArray.array;
@@ -787,6 +872,7 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
     if(setup) receiveUntilAnswered(reader,input,.5,7,2);
     step("session setup answered");
     BOOL sensorsStarted=NO,accelStarted=NO,gyroStarted=NO,accelAttempted=NO,gyroAttempted=NO,queryPending=NO,stopped=NO,discoverySent=NO,baselineVerified=NO,motionInputVerified=NO;NSUInteger processed=0,responses=0,queries=0,rootStartupQueries=0,rootUnanswered=0;
+    BOOL discoveredMotionAttempted=NO;NSInteger discoveredMotionService=-1;
     CaseSnapshot *transfer=CaseSnapshot.new;transfer.output=output;transfer.targetBound=YES;double nextQuery=0,lastRootQueryAt=0;
     int exitCode=HelperExitOK;NSString *reason=@"deadline";
     NSURL *leaseURL=[directory.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"app-lease.txt"];
@@ -795,6 +881,11 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
     else if(!reader.controls) {exitCode=HelperExitNoSessionReply;reason=@"AACP channel opened but nothing answered the session setup";}
     else if(!sessionLeaseFresh(leaseURL,NSProcessInfo.processInfo.systemUptime)) {stopped=YES;exitCode=HelperExitLeaseExpired;reason=@"app session lease expired before sensors started";}
     else {
+        if(!sendPacket(output,sensorDescriptorRequest(),"read-only sensor descriptors")) {
+            exitCode=HelperExitWriteFailed;reason=@"sensor inventory request write failed";
+        }
+    }
+    if(!exitCode && !stopped) {
         accelAttempted=YES;accelStarted=sendPacket(output,sensorSetting(11,5000),"known accel");pump(.2);
         gyroAttempted=YES;gyroStarted=sendPacket(output,sensorSetting(12,5000),"known gyro");
         sensorsStarted=accelStarted && gyroStarted;
@@ -818,6 +909,13 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
         if(phase.length) reader.phase=phase;
         double now=NSProcessInfo.processInfo.systemUptime;
         if(reader.motionStreamFailed) {[transfer fail:HelperExitMotionPipeClosed reason:@"Motion stream write failed"];reason=transfer.error;break;}
+        // Only subscribe if this very peer advertised the known motion service.
+        // Same mode-2 configuration as the raw sensors; 20,000 us is 50 Hz.
+        if(!discoveredMotionAttempted && reader.discoveredMotionService>=0 && !reader.accelReports && !reader.gyroReports && now-began>3) {
+            discoveredMotionService=reader.discoveredMotionService;discoveredMotionAttempted=YES;
+            printf("RTB DISCOVERED devmotion6 service=%ld; starting 50 Hz fallback\n",(long)discoveredMotionService);
+            if(!sendPacket(output,sensorSetting((uint8_t)discoveredMotionService,20000),"discovered devmotion6")) {exitCode=HelperExitWriteFailed;reason=@"discovered motion start write failed";break;}
+        }
         if([phase isEqualToString:@"closed_confirmed"]) [transfer confirmClosedAt:now];
         RootVersionAction overdue=steadyRootVersionAction(transfer.rootVersionValid,queryPending,rootUnanswered,now-lastRootQueryAt);
         if(overdue==RootVersionFail) {[transfer fail:HelperExitReplyTimeout reason:@"earbud stopped answering the VERSION heartbeat"];reason=transfer.error;break;}
@@ -890,10 +988,12 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
     // 1. Sensor STOP, then (2) the scoped Abandon of this exact live offered
     // asset. Abandon can consume the case's staged analytics; see beginCleanup.
     BOOL accelStopped=NO,gyroStopped=NO;
+    BOOL discoveredMotionStopped=!discoveredMotionAttempted || sendPacket(output,sensorSetting((uint8_t)discoveredMotionService,0),"discovered devmotion6 STOP");
     stopSensorsThenRelease(output,transfer,accelAttempted,gyroAttempted,&accelStopped,&gyroStopped);
     // On a channel the link already ended a STOP cannot be delivered; the
     // dropped link stays the reported cause (the log line below still shows it).
-    if((accelAttempted || gyroAttempted) && (!accelStopped || !gyroStopped) && !streamEnded(input) && !streamEnded(output)) [transfer fail:HelperExitSensorStopFailed reason:@"sensor STOP write failed"];
+    BOOL sensorStopFailed=((accelAttempted || gyroAttempted) && (!accelStopped || !gyroStopped)) || !discoveredMotionStopped;
+    if(sensorStopFailed && !streamEnded(input) && !streamEnded(output)) [transfer fail:HelperExitSensorStopFailed reason:@"sensor STOP write failed"];
     // The release was already sent; a pointer session doesn't hold up a disconnect for its receipt.
     double cleanupDeadline=MIN(operationDeadline,NSProcessInfo.processInfo.systemUptime+1.5);
     while(transfer.cleanupWriteComplete && !transfer.cleanupAck) {
@@ -958,6 +1058,54 @@ static void testSensorWire(ConsoleReader *reader,uint64_t stamp) {
     [reader stream:input handleEvent:NSStreamEventHasBytesAvailable];[input close];
 }
 static void sessionChecks(void) {
+    NSDictionary *inventory=@{@"AccessoryService":@"devmotion6",@"SerialNumber":@"must-not-be-logged"};
+    NSData *binaryInventory=CFBridgingRelease(IOCFSerialize((__bridge CFTypeRef)inventory,kIOCFSerializeToBinary));
+    check([sensorServiceName(binaryInventory) isEqualToString:@"devmotion6"],@"IOKit binary service descriptors reveal only the service label");
+    NSData *privateOnly=[NSPropertyListSerialization dataWithPropertyList:@{@"SerialNumber":@"devmotion6"} format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+    check(!sensorServiceName(privateOnly).length,@"a motion token in an unrelated descriptor field cannot select a service");
+    check(!sensorServiceName([@"devmotion6" dataUsingEncoding:NSASCIIStringEncoding]).length,@"unparsed descriptor bytes cannot select a service");
+    uint8_t inventoryHeader[]={8,37,18};NSMutableData *inventoryEntry=[packet(inventoryHeader,sizeof(inventoryHeader)) mutableCopy];
+    [inventoryEntry appendData:varintData((uint32_t)binaryInventory.length)];[inventoryEntry appendData:binaryInventory];
+    uint8_t descriptorTag=0x2a;NSMutableData *inventoryMessage=[NSMutableData dataWithBytes:&descriptorTag length:1];
+    [inventoryMessage appendData:varintData((uint32_t)inventoryEntry.length)];[inventoryMessage appendData:inventoryEntry];
+    ConsoleReader *discovered=ConsoleReader.new;[discovered discoverSensorServices:0x100000 payload:inventoryMessage];
+    check(discovered.discoveredMotionService==37 && !discovered.accelReports && !discovered.gyroReports,@"motion service selection uses the advertised ID, not a hard-coded model ID");
+    uint8_t commandTag=0x3a;NSMutableData *notInventory=[NSMutableData dataWithBytes:&commandTag length:1];
+    [notInventory appendData:varintData((uint32_t)inventoryEntry.length)];[notInventory appendData:inventoryEntry];
+    ConsoleReader *notAdvertised=ConsoleReader.new;[notAdvertised discoverSensorServices:0x100000 payload:notInventory];
+    check(notAdvertised.discoveredMotionService==-1,@"a command payload cannot authorize an undiscovered sensor subscription");
+    uint8_t fused[56]={0};fused[0]=1;fused[9]=6;fused[11]=3;
+    uint64_t nanos=1234567000;
+    for(unsigned i=0;i<8;i++) fused[1+i]=(uint8_t)(nanos>>(8*i));
+    const int16_t acceleration[]={1024,-512,256},rotation[]={512,-256,128};
+    for(unsigned i=0;i<3;i++) {
+        uint16_t a=(uint16_t)acceleration[i],g=(uint16_t)rotation[i];
+        fused[44+2*i]=(uint8_t)a;fused[45+2*i]=(uint8_t)(a>>8);
+        fused[26+2*i]=(uint8_t)g;fused[27+2*i]=(uint8_t)(g>>8);
+    }
+    DevMotion56Sample sample;
+    check(decodeDevMotion56(packet(fused,sizeof(fused)),&sample) && sample.stamp==1234567 && sample.accel[0]==100000 && sample.accel[1]==-50000 && sample.accel[2]==25000,@"packed motion nanoseconds and Q10 g match the existing raw units");
+    check(sample.gyro[0]==5729578 && sample.gyro[1]==-2864789 && sample.gyro[2]==1432394,@"packed Q9 rad/s preserves signs and converts to 1e-5 degrees/s");
+    check(!decodeDevMotion56(packet(fused,sizeof(fused)-1),&sample),@"a truncated packed motion report is not read");
+    fused[9]=3;check(!decodeDevMotion56(packet(fused,sizeof(fused)),&sample),@"an unverified packed layout is not treated as raw motion");fused[9]=6;
+    fused[11]=2;check(!decodeDevMotion56(packet(fused,sizeof(fused)),&sample),@"sensor startup without both valid components is skipped");fused[11]=3;
+    uint8_t commandHeader[]={8,37,0x1a,sizeof(fused)};
+    NSMutableData *motionCommand=[packet(commandHeader,sizeof(commandHeader)) mutableCopy];[motionCommand appendBytes:fused length:sizeof(fused)];
+    uint8_t motionTag=0x3a;NSMutableData *motionMessage=[NSMutableData dataWithBytes:&motionTag length:1];
+    [motionMessage appendData:varintData((uint32_t)motionCommand.length)];[motionMessage appendData:motionCommand];
+    NSData *motionWire=sensorEnvelope(motionMessage);
+    ConsoleReader *rawFirst=ConsoleReader.new;rawFirst.discoveredMotionService=37;
+    testSensorWire(rawFirst,1234568);
+    NSInputStream *fallbackInput=[NSInputStream inputStreamWithData:motionWire];[fallbackInput open];
+    [rawFirst stream:fallbackInput handleEvent:NSStreamEventHasBytesAvailable];[fallbackInput close];
+    check(!rawFirst.usingDevMotion && rawFirst.accelFresh==1 && !rawFirst.gyroReports,@"an active raw source is never replaced by a packed source");
+    for(unsigned pass=0;pass<2;pass++) {
+        NSInputStream *motionInput=[NSInputStream inputStreamWithData:motionWire];[motionInput open];
+        [discovered stream:motionInput handleEvent:NSStreamEventHasBytesAvailable];[motionInput close];
+    }
+    check(discovered.usingDevMotion && discovered.accelFresh==1 && discovered.gyroFresh==1 && [discovered.lastSamples[@"11"][@"x"] intValue]==100000 && [discovered.lastSamples[@"12"][@"x"] intValue]==5729578,@"the discovered packed stream reaches both raw consumers without replaying duplicate timestamps");
+    testSensorWire(discovered,1234568);
+    check(discovered.accelFresh==1,@"raw and packed sensor clock domains are never mixed in one session");
     NSURL *lease=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString]];
     [@"100\n" writeToURL:lease atomically:YES encoding:NSUTF8StringEncoding error:nil];
     check(sessionLeaseFresh(lease,100) && sessionLeaseFresh(lease,104.99) && !sessionLeaseFresh(lease,105),@"app lease expires after five seconds without a heartbeat");
@@ -1070,6 +1218,8 @@ static void hardeningChecks(void) {
     check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
     check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
     check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
+    check(chargingCaseModelMatches(@"MagSafe Charging Case (USB-C)") && chargingCaseModelMatches(@" magsafe charging case (usb-c)\n"),@"the USB-C MagSafe charging-case product label is accepted");
+    check(!chargingCaseModelMatches(@"MagSafe Charger") && !chargingCaseModelMatches(@"MagSafe Charging Case (Unknown)") && !chargingCaseModelMatches(@"AirPods Pro (2nd generation)"),@"the case-label compatibility rule still rejects chargers, unknown products and earbuds");
     check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];

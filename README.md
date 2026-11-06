@@ -29,7 +29,7 @@
 | Item | Status |
 |---|---|
 | AirPods Pro 3, macOS 26, Apple Silicon | Tested on one Mac with one pair |
-| AirPods Pro 2 | Recognized, not tested |
+| AirPods Pro 2 | Experimental motion fallback; [test results and limitations](Docs/AIRPODS-PRO-2.md) |
 | AirPods paired with your Mac | Required |
 | Xcode | Required to build |
 

@@ -6,7 +6,7 @@ airpointer_signing_identity="${AIRPOINTER_SIGNING_IDENTITY:--}"
 # Compile first, so a failed build leaves the last good app as it was.
 compiled="$(mktemp -d)"
 trap 'rm -rf "$compiled"' EXIT
-clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -framework CoreBluetooth -framework IOBluetooth Sources/ClosedCaseMotion/CaseSustainedRenewal.m -o "$compiled/ClosedCaseMotion.bin"
+clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -framework CoreBluetooth -framework IOBluetooth -framework IOKit Sources/ClosedCaseMotion/CaseSustainedRenewal.m -o "$compiled/ClosedCaseMotion.bin"
 xcrun swiftc -swift-version 5 -O Sources/ClosedCaseRestore/ClosedCaseRestore.swift -o "$compiled/ClosedCaseRestore.bin" -framework Foundation -framework CoreBluetooth -framework IOBluetooth
 xcrun swiftc -swift-version 5 "$airpointer_build_mode" Sources/AirPointer/**/*.swift -o "$compiled/AirPointer" -framework AppKit -framework JavaScriptCore -framework QuartzCore -framework ApplicationServices -framework Carbon -framework AVFoundation -framework CoreAudio -framework CoreBluetooth
 mkdir -p AirPointer.app/Contents/MacOS AirPointer.app/Contents/Resources
