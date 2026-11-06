@@ -407,7 +407,9 @@ static BOOL earbudModelMatches(NSString *name) {
 }
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+    // AirPods Pro 2 USB-C reports this ModelName without an AirPods prefix.
+    return ([folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"]) ||
+        [folded isEqualToString:@"magsafe charging case (usb-c)"];
 }
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
@@ -1071,6 +1073,13 @@ static void hardeningChecks(void) {
     check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
     check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
     check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
+    check(chargingCaseModelMatches(@"MagSafe Charging Case (USB-C)") && chargingCaseModelMatches(@" MAGSAFE CHARGING CASE (USB-C)\n") &&
+          !earbudModelMatches(@"MagSafe Charging Case (USB-C)"),@"the observed USB-C case alias uses existing normalization and cannot identify an earbud");
+    for(NSString *name in @[@"MagSafe Charging Case",@"MagSafe Charging Case (USB-C2)",@"MagSafe Charging Case (Lightning)",
+        @"My MagSafe Charging Case (USB-C)",@"MagSafe Charging Case (USB-C) Pro",@"MagSafe  Charging Case (USB-C)",
+        @"MagSafe Charging Case (USB C)",@"MagSafe Charging Case (USB‑C)",@"MagSafe Charging Case (USB-C",@"MagSafe Charging Cases (USB-C)"]) {
+        check(!chargingCaseModelMatches(name),[NSString stringWithFormat:@"similar USB-C case name remains rejected: %@",name]);
+    }
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];
     check(root.rootVerified && !root.error,@"root identity accepts a later AirPods Pro ModelName");
@@ -1083,6 +1092,13 @@ static void hardeningChecks(void) {
     CaseSnapshot *peerAsCase=testSession();[peerAsCase.announced addObject:@1];peerAsCase.caseActive=YES;peerAsCase.caseModelSent=YES;peerAsCase.pending=@"model";
     [peerAsCase handleMessage:testChild(4,10,testModel(@"AirPods Pro"))];
     check(!peerAsCase.caseModelVerified && peerAsCase.failure==HelperExitWrongCaseModel,@"earbud ModelName on endpoint 1 exits WRONG_CASE_MODEL");
+    CaseSnapshot *usbCCase=testSession();[usbCCase.announced addObject:@1];usbCCase.caseActive=YES;usbCCase.caseModelSent=YES;usbCCase.pending=@"model";
+    [usbCCase handleMessage:testChild(4,10,testModel(@"MagSafe Charging Case (USB-C)"))];
+    check(usbCCase.caseModelVerified && !usbCCase.error,@"the observed USB-C ModelName verifies on the announced case endpoint");
+    usbCCase.pending=@"identity_refresh";[usbCCase handleMessage:testChild(4,11,testModel(@" MAGSAFE CHARGING CASE (USB-C)\n"))];
+    check(!usbCCase.error && usbCCase.identityRefreshReplies==1,@"USB-C identity refresh accepts the same normalized model");
+    usbCCase.pending=@"identity_refresh";[usbCCase handleMessage:testChild(4,12,testModel(@"AirPods Charging Case"))];
+    check(usbCCase.failure==HelperExitWrongCaseModel,@"USB-C identity refresh still rejects a different supported case model");
     CaseSnapshot *refresh=testSession();[refresh.announced addObject:@1];refresh.caseActive=YES;refresh.caseModelVerified=YES;refresh.caseIdentity=@"AirPods Charging Case";refresh.pending=@"identity_refresh";
     [refresh handleMessage:testChild(4,11,testModel(@"AirPods Charging Case "))];
     check(!refresh.error && refresh.identityRefreshReplies==1,@"identity refresh accepts the same case ModelName tolerantly");
