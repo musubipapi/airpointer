@@ -25,6 +25,17 @@ struct ClosedCasePointerFilter{
     }
 }
 
+// Speed is the slope through the center. The curve still sends each calibrated edge to the
+// matching screen edge, so a faster or slower pointer keeps the whole aimed range and the whole screen.
+func closedCasePointerPoint(_ point:CGPoint,speed:Double)->CGPoint{
+    func axis(_ value:Double)->Double{
+        let offset=(value-0.5)*2
+        guard offset.isFinite,speed.isFinite,speed>0 else{return value}
+        return min(1,max(0,0.5+0.5*offset*speed/(1+(speed-1)*abs(offset))))
+    }
+    return CGPoint(x:axis(point.x),y:axis(point.y))
+}
+
 func readClosedCaseMotionPipe(_ stream:FileHandle) throws ->Data?{
     var bytes=[UInt8](repeating:0,count:32768)
     let count=Darwin.read(stream.fileDescriptor,&bytes,bytes.count)
@@ -259,6 +270,14 @@ func pruneClosedCaseSessions(in root:URL,keeping count:Int) {
 }
 
 func runClosedCaseNativeChecks() throws {
+    let edge=closedCasePointerPoint(CGPoint(x:0,y:1),speed:2.4)
+    let fast=closedCasePointerPoint(CGPoint(x:0.75,y:0.5),speed:2.4)
+    let slow=closedCasePointerPoint(CGPoint(x:0.75,y:0.5),speed:0.4)
+    let normal=closedCasePointerPoint(CGPoint(x:0.75,y:0.25),speed:1)
+    guard edge.x==0,edge.y==1,normal.x==0.75,normal.y==0.25,fast.x>0.75,fast.x<1,fast.y==0.5,slow.x>0.5,slow.x<0.75,slow.y==0.5,
+          closedCasePointerPoint(CGPoint(x:0,y:1),speed:0.4)==CGPoint(x:0,y:1) else{
+        throw LessonError.message("Pointer speed must keep the calibrated edges on the screen edges.")
+    }
     let temporary=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString,isDirectory:true)
     try FileManager.default.createDirectory(at:temporary,withIntermediateDirectories:true)
     defer{try? FileManager.default.removeItem(at:temporary)}
@@ -877,9 +896,9 @@ final class ClosedCaseSession: NSObject {
                 }else{settle=(stamp,q)}
             }
             guard calibrated,let point=result["point"] as? [Double],point.count==2,point.allSatisfy(\.isFinite) else{return}
-            let x=0.5+(point[0]-0.5)*speed,y=0.5+(point[1]-0.5)*speed
+            let aimed=closedCasePointerPoint(CGPoint(x:point[0],y:point[1]),speed:speed)
             if let tapHold{smooth=tapHold}else{
-                smooth=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
+                smooth=pointerFilter.feed(aimed,at:stamp*1e-6)
                 recentPoints.append((stamp*1e-6,smooth));while let first=recentPoints.first,stamp*1e-6-first.t>0.5{recentPoints.removeFirst()}
             }
             setAim(smooth);onPoint?(smooth)
