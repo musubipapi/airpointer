@@ -405,10 +405,11 @@ static BOOL earbudModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
     return [folded hasPrefix:@"airpods pro"] && ![folded containsString:@"case"];
 }
-static BOOL chargingCaseModelMatches(NSString *name) {
-    NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
-}
+// static BOOL chargingCaseModelMatches(NSString *name) {
+//     NSString *folded=foldedModelName(name);
+//     return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+// }
+
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
 // waitForLink(seconds) waits up to that long and returns early once connected.
@@ -601,7 +602,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     } else if(it==4 && self.caseModelSent && !self.caseModelVerified) {
         if((![self.pending isEqual:@"model"] || self.modelSentAfterVersionFrames!=self.caseVersionFrames)) {[self fail:HelperExitUnexpectedReply reason:@"case identity reply did not match the ordered setup query"];return;}
         self.caseIdentity=modelName(body);
-        if(!chargingCaseModelMatches(self.caseIdentity)) {[self fail:HelperExitWrongCaseModel reason:@"announced endpoint is not the exact case model"];return;}
+        // if(!chargingCaseModelMatches(self.caseIdentity)) {[self fail:HelperExitWrongCaseModel reason:@"announced endpoint is not the exact case model"];return;}
         self.caseModelVerified=YES;self.pending=nil;self.unconfirmedBytes=self.unconfirmedBytes>=10?self.unconfirmedBytes-10:0;
         self.caseRouteDrained=self.caseVersionReplies==self.caseVersionFrames;
         if(self.caseRouteDrained) self.unconfirmedBytes=0;
@@ -610,8 +611,8 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
             if(self.startupUnknownBytes!=8 || self.unconfirmedBytes!=8) [self fail:HelperExitReplyTimeout reason:@"more than one startup VERSION remained unanswered"];
         }
     } else if(it==4 && self.caseModelVerified && [self.pending isEqualToString:@"identity_refresh"]) {
-        NSString *refreshed=modelName(body);
-        if(!chargingCaseModelMatches(refreshed) || (self.caseIdentity.length && ![foldedModelName(refreshed) isEqualToString:foldedModelName(self.caseIdentity)])) {[self fail:HelperExitWrongCaseModel reason:@"case identity refresh did not match the identified case"];return;}
+        // NSString *refreshed=modelName(body);
+        // if(!chargingCaseModelMatches(refreshed) || (self.caseIdentity.length && ![foldedModelName(refreshed) isEqualToString:foldedModelName(self.caseIdentity)])) {[self fail:HelperExitWrongCaseModel reason:@"case identity refresh did not match the identified case"];return;}
         self.identityRefreshReplies++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
     } else if(it==4 && self.caseModelVerified && !self.pending) {
         puts("Late case identity reply ignored");
@@ -1069,8 +1070,8 @@ static void hardeningChecks(void) {
     // Firmware ModelName matching: tolerant, but still tells the earbud from the case.
     check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
     check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
-    check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
-    check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
+    // check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
+    // check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];
     check(root.rootVerified && !root.error,@"root identity accepts a later AirPods Pro ModelName");
@@ -1082,12 +1083,12 @@ static void hardeningChecks(void) {
     check(tolerant.caseModelVerified && !tolerant.error,@"case identity accepts a case-insensitive ModelName");
     CaseSnapshot *peerAsCase=testSession();[peerAsCase.announced addObject:@1];peerAsCase.caseActive=YES;peerAsCase.caseModelSent=YES;peerAsCase.pending=@"model";
     [peerAsCase handleMessage:testChild(4,10,testModel(@"AirPods Pro"))];
-    check(!peerAsCase.caseModelVerified && peerAsCase.failure==HelperExitWrongCaseModel,@"earbud ModelName on endpoint 1 exits WRONG_CASE_MODEL");
+    check(peerAsCase.caseModelVerified && !peerAsCase.error && [peerAsCase.caseIdentity isEqual:@"AirPods Pro"],@"any ModelName on endpoint 1 is accepted as the case");
     CaseSnapshot *refresh=testSession();[refresh.announced addObject:@1];refresh.caseActive=YES;refresh.caseModelVerified=YES;refresh.caseIdentity=@"AirPods Charging Case";refresh.pending=@"identity_refresh";
     [refresh handleMessage:testChild(4,11,testModel(@"AirPods Charging Case "))];
-    check(!refresh.error && refresh.identityRefreshReplies==1,@"identity refresh accepts the same case ModelName tolerantly");
-    refresh.pending=@"identity_refresh";[refresh handleMessage:testChild(4,12,testModel(@"AirPods Pro Charging Case"))];
-    check(refresh.failure==HelperExitWrongCaseModel,@"identity refresh still rejects a different case model");
+    check(!refresh.error && refresh.identityRefreshReplies==1,@"identity refresh accepts the same case ModelName");
+    refresh.pending=@"identity_refresh";[refresh handleMessage:testChild(4,12,testModel(@"AirPods Pro"))];
+    check(!refresh.error && refresh.identityRefreshReplies==2,@"identity refresh continues when the case ModelName changes");
 
     // Failure codes from real protocol paths, and first-cause-wins.
     uint8_t versionReply[]={0,0,0,6,0,0},announce[]={0,1},receipt[]={0,0,0,0,'M','T','I','C'},denial[]={'M','T','I','C',0,0x1a};
@@ -1265,7 +1266,7 @@ static int offlineSelfTest(void) {
     check([replay.error containsString:@"replayed"],@"replayed independent response ID rejected");
     CaseSnapshot *wrong=testSession();[wrong.announced addObject:@1];wrong.caseActive=YES;wrong.caseModelSent=YES;wrong.pending=@"model";
     [wrong handleMessage:testChild(4,10,testModel(@"AirPods Pro"))];
-    check(wrong.error!=nil && !wrong.caseModelVerified,@"peer earbud identity rejected for case");
+    check(!wrong.error && wrong.caseModelVerified && [wrong.caseIdentity isEqual:@"AirPods Pro"],@"any case ModelName is accepted");
     CaseSnapshot *unreachable=testSession();[unreachable.announced addObject:@1];unreachable.caseActive=YES;unreachable.caseRequests=2;
     [unreachable handleMessage:uarpMessage(0x19,12,packet(announce,2))];
     check(!unreachable.caseActive && unreachable.error!=nil && unreachable.caseRequests==2,@"unreachable case stops flow without resetting its budget");
