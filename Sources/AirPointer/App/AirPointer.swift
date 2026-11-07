@@ -2,6 +2,14 @@ import AppKit
 import ApplicationServices
 import Carbon
 
+// Applies the speed gain to an unclamped aim, then clamps to the screen.
+// The gain must scale the aim before clamping: scaling an already-clamped
+// value would make every speed below 1x unable to reach the screen edges.
+func pointerAim(_ point: [Double], speed: Double) -> CGPoint {
+    CGPoint(x: min(1, max(0, 0.5 + (point[0]-0.5)*speed)),
+            y: min(1, max(0, 0.5 + (point[1]-0.5)*speed)))
+}
+
 func screenPoint(_ normalized: CGPoint, bounds: CGRect) -> CGPoint {
     CGPoint(x: bounds.minX + 1 + normalized.x * (bounds.width - 2),
             y: bounds.minY + 1 + normalized.y * (bounds.height - 2))
@@ -179,6 +187,16 @@ if CommandLine.arguments.contains("--check-audio-output-policy") {
     selfCheck(screenPoint(CGPoint(x: 0.5, y: 0.5), bounds: bounds) == CGPoint(x: -960, y: 540))
     selfCheck(screenPoint(.zero, bounds: bounds) == CGPoint(x: -1919, y: 1))
     selfCheck(screenPoint(CGPoint(x: 1, y: 1), bounds: bounds) == CGPoint(x: -1, y: 1079))
+    // Every speed must still reach all four edges, given enough rotation.
+    for speed in [0.4, 0.7, 1.0, 1.4, 2.4] {
+        let far = 0.5 + 0.5/speed
+        selfCheck(pointerAim([far, far], speed: speed) == CGPoint(x: 1, y: 1))
+        selfCheck(pointerAim([1-far, 1-far], speed: speed) == CGPoint(x: 0, y: 0))
+        selfCheck(pointerAim([0.5, 0.5], speed: speed) == CGPoint(x: 0.5, y: 0.5))
+    }
+    // A slower speed needs more rotation for the same point, but is not cropped.
+    selfCheck(pointerAim([1, 1], speed: 0.7) == CGPoint(x: 0.85, y: 0.85))
+    selfCheck(pointerAim([1.8, 1.8], speed: 0.7) == CGPoint(x: 1, y: 1))
     runPoseChecks()
     do{try runPointerSettingsChecks()}catch{fputs("Pointer settings check failed: \(error.localizedDescription)\n",stderr);exit(1)}
     do{try runClosedCaseStageChecks()}catch{fputs("Closed-case stage check failed: \(error.localizedDescription)\n",stderr);exit(1)}

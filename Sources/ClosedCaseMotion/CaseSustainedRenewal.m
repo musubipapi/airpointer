@@ -407,7 +407,10 @@ static BOOL earbudModelMatches(NSString *name) {
 }
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+    // The AirPods Pro 3 case answers "AirPods Charging Case"; the AirPods Pro 2
+    // USB-C case answers "MagSafe Charging Case (USB-C)". Accept either family
+    // prefix, still requiring "charging case" so an earbud never matches here.
+    return ([folded hasPrefix:@"airpods"] || [folded hasPrefix:@"magsafe"]) && [folded containsString:@"charging case"];
 }
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
@@ -1070,6 +1073,8 @@ static void hardeningChecks(void) {
     check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
     check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
     check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
+    check(chargingCaseModelMatches(@"MagSafe Charging Case (USB-C)") && chargingCaseModelMatches(@" magsafe charging case "),@"case ModelName match accepts the AirPods Pro 2 USB-C MagSafe case");
+    check(!chargingCaseModelMatches(@"MagSafe Battery Pack") && !chargingCaseModelMatches(@"MagSafe"),@"case match rejects other MagSafe accessories");
     check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];
