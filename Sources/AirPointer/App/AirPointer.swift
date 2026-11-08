@@ -25,6 +25,7 @@ final class App: NSObject, NSApplicationDelegate {
     // Paired AirPods Pro, refreshed when Settings opens.
     var closedCasePairs:[ClosedCaseAirPods]=[]
     var timer: Timer?
+    var quitSignalSources:[DispatchSourceSignal]=[]
     var homeMenuItems:[NSMenuItem]=[]
     var disconnectMenuItem:NSMenuItem?
     var home:AirPointerHome?
@@ -46,6 +47,7 @@ final class App: NSObject, NSApplicationDelegate {
         }
         CursorSize.shared.restore()
         AudioOutputGuard.shared.restoreAfterCrash()
+        installQuitSignalHandlers()
         setupMenu()
         installNotch()
         let stateTimer=Timer(timeInterval:0.08,repeats:true){[weak self] _ in self?.checkState()}
@@ -149,6 +151,17 @@ final class App: NSObject, NSApplicationDelegate {
         }
         sender.activate(ignoringOtherApps:true)
         return false
+    }
+    // SIGTERM, SIGINT and SIGHUP (kill, Ctrl-C, a closing terminal) would end the app without applicationWillTerminate, leaving
+    // the cursor enlarged and the AirPods audio moved. Turn them into a normal quit so the same cleanup runs.
+    private func installQuitSignalHandlers() {
+        for number in [SIGTERM,SIGINT,SIGHUP] {
+            signal(number,SIG_IGN)
+            let source=DispatchSource.makeSignalSource(signal:number,queue:.main)
+            source.setEventHandler{NSApp.terminate(nil)}
+            source.resume()
+            quitSignalSources.append(source)
+        }
     }
     func applicationWillTerminate(_ notification: Notification) {
         closedCaseSession?.shutdown()
