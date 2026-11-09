@@ -877,9 +877,9 @@ final class ClosedCaseSession: NSObject {
                 }else{settle=(stamp,q)}
             }
             guard calibrated,let point=result["point"] as? [Double],point.count==2,point.allSatisfy(\.isFinite) else{return}
-            let x=0.5+(point[0]-0.5)*speed,y=0.5+(point[1]-0.5)*speed
+            let aim=pointerAim(point,speed:speed)
             if let tapHold{smooth=tapHold}else{
-                smooth=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
+                smooth=pointerFilter.feed(aim,at:stamp*1e-6)
                 recentPoints.append((stamp*1e-6,smooth));while let first=recentPoints.first,stamp*1e-6-first.t>0.5{recentPoints.removeFirst()}
             }
             setAim(smooth);onPoint?(smooth)
