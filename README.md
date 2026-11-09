@@ -29,9 +29,12 @@
 | Item | Status |
 |---|---|
 | AirPods Pro 3, macOS 26, Apple Silicon | Tested on one Mac with one pair |
-| AirPods Pro 2 | Recognized, not tested |
+| AirPods Pro 2 (USB-C), macOS 27, Apple Silicon | Tested on one Mac with one pair |
+| AirPods Pro 2 (Lightning), AirPods Pro (1st generation), AirPods 3, AirPods 4, AirPods 4 ANC, AirPods 5 | Experimental, not tested. They have the gyroscope pointing needs, but their cases may handle the lid-closed requests differently. |
+| AirPods 1 and 2 | Not supported: no gyroscope |
+| AirPods Max | Not supported: no case |
 | AirPods paired with your Mac | Required |
-| Xcode | Required to build |
+| Xcode or the Command Line Tools | Required to build |
 
 Normal connect and disconnect have run many times on that Mac and pair. These
 cases have not been tested on purpose:
@@ -47,6 +50,15 @@ cases have not been tested on purpose:
 zsh ./build.sh
 open AirPointer.app
 ```
+
+To keep it like any other app, copy it to `/Applications` after building:
+
+```sh
+ditto AirPointer.app /Applications/AirPointer.app
+```
+
+macOS ties the Accessibility permission to the build, so each rebuild asks for it
+again. Without rebuilding, it stays granted.
 
 The build also runs `--self-test` and the tap check. The other offline checks are
 under [For developers](#for-developers). Do not build during a pointer session.
@@ -80,6 +92,25 @@ different shortcut, go to Settings.
 <p align="center">
   <img src="Assets/Readme/screens.png" width="100%" alt="The AirPointer window, the menu bar panel, and the notch while pointing">
 </p>
+
+| Gesture | What it does |
+|---|---|
+| Move the case | Moves the cursor |
+| Tap the front | Clicks. Tap twice quickly to double-click. |
+| Tap the back | Right-clicks. Turn it off in Settings. |
+| Hold Control and tap the front | Right-clicks |
+| Twist the case like a key, past about 15° | Scrolls. The cursor holds still. Twist further to scroll faster. |
+
+Settings also has:
+
+- **Open at login**, which the app offers once after setup
+- **Smoothness**: steadiness when still, fast moves, and glide
+- **Scroll**: on or off, speed, and direction (Standard or Inverted)
+
+The setup and pointing screens show the case of the AirPods you connect: the Pro
+case for AirPods Pro, or the AirPods 3/4/5 case.
+
+The back tap is new and tuned less than the front tap, so it can miss now and then.
 
 On the tested AirPods, a session ends about 30 minutes after the lid closes. To
 continue, open and close the lid. See [Known limitations](#known-limitations).
@@ -277,11 +308,24 @@ AirPointer.app/Contents/Resources/ClosedCaseMotion.bin --self-test
 Quit AirPointer, delete this folder, then run:
 
 ```sh
+/Applications/AirPointer.app/Contents/MacOS/AirPointer --unregister-login-item
+rm -rf /Applications/AirPointer.app
 rm -rf ~/Library/Application\ Support/AirPointer
 defaults delete local.airpointer
 tccutil reset Accessibility local.airpointer
 tccutil reset BluetoothAlways local.airpointer
 ```
+
+## Credits
+
+These changes come from pull requests to this repository:
+
+| Change | From |
+|---|---|
+| Restore the cursor size on SIGTERM, SIGINT and SIGHUP | [#11](https://github.com/musubipapi/airpointer/pull/11) by [panoskentros](https://github.com/panoskentros) |
+| Resend one late case request before timing out | [#4](https://github.com/musubipapi/airpointer/pull/4) by [adcreativeflow](https://github.com/adcreativeflow) |
+| Reach every screen edge below 1× speed, and the MagSafe case-name checks | [#9](https://github.com/musubipapi/airpointer/pull/9) by [slibertiny](https://github.com/slibertiny) |
+| Accept the AirPods Pro 2 MagSafe case | Found on its own here, and also in [#1](https://github.com/musubipapi/airpointer/pull/1) by [LuckyLivio](https://github.com/LuckyLivio), [#7](https://github.com/musubipapi/airpointer/pull/7) by [mizrahis](https://github.com/mizrahis) and #9 |
 
 ## License
 

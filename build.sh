@@ -12,6 +12,9 @@ xcrun swiftc -swift-version 5 "$airpointer_build_mode" Sources/AirPointer/**/*.s
 mkdir -p AirPointer.app/Contents/MacOS AirPointer.app/Contents/Resources
 cp Assets/CaseFront.png Assets/AppIcon.icns AirPointer.app/Contents/Resources/
 for frame in Assets/CaseLid/lid-*.png; do cp "$frame" "AirPointer.app/Contents/Resources/Case${frame:t:r:s/lid/Lid/}.png"; done
+# The AirPods 3/4/5 case, shown when those AirPods are chosen (see CaseStepArt).
+cp Assets/AirPodsCase/CaseFront.png AirPointer.app/Contents/Resources/CaseAirPods-Front.png
+for frame in Assets/AirPodsCase/Lid/lid-*.png; do cp "$frame" "AirPointer.app/Contents/Resources/CaseAirPods-${frame:t:r:s/lid/Lid/}.png"; done
 cp Assets/TapClick/click.wav AirPointer.app/Contents/Resources/TapClick.wav
 cp Assets/NotchShimmer.wav AirPointer.app/Contents/Resources/NotchShimmer.wav
 cp Assets/TapClick/LICENSE-cuelume.txt AirPointer.app/Contents/Resources/LICENSE-cuelume.txt

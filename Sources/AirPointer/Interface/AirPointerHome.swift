@@ -517,6 +517,35 @@ private final class SettingsPage:NSObject {
     private let clickSound=InkSwitch()
     private let shortcutControl=PointerShortcutControl()
     private let speedValue=rkLabel("1.0×",13,.medium)
+    // Smoothing, right-click and scroll settings, written straight to the preferences the session reads live.
+    private let steadiness=NSSlider(value:0.5,minValue:0,maxValue:1,target:nil,action:nil)
+    private let snappiness=NSSlider(value:14,minValue:0,maxValue:40,target:nil,action:nil)
+    private let glide=NSSlider(value:0.03,minValue:0,maxValue:0.1,target:nil,action:nil)
+    private let backTap=InkSwitch(),twistScroll=InkSwitch(),openAtLogin=InkSwitch()
+    private let scrollDirection=NSPopUpButton()
+    private let loginNote=rkLabel("Starts AirPointer in the menu bar when you log in.",12,.regular,.secondaryLabelColor)
+    private func applyLogin(){
+        openAtLogin.setOn(LoginItem.isEnabled || LoginItem.needsApproval,animated:false)
+        rkSetText(loginNote,LoginItem.needsApproval ? "Allow AirPointer in System Settings → General → Login Items.":"Starts AirPointer in the menu bar when you log in.")
+    }
+    private let scrollSpeed=NSSlider(value:1,minValue:0.3,maxValue:3,target:nil,action:nil)
+    private let backFirmness=NSSlider(value:0.25,minValue:0.15,maxValue:0.8,target:nil,action:nil)
+    private let backFirmnessValue=rkLabel("",13,.medium)
+    private let steadinessValue=rkLabel("",13,.medium),snappinessValue=rkLabel("",13,.medium),glideValue=rkLabel("",13,.medium),scrollSpeedValue=rkLabel("",13,.medium)
+    // Steadiness 0…1 maps to the filter's resting cutoff 3.5 Hz…0.4 Hz on a log scale (default 1.2 Hz ≈ 0.49).
+    private static func cutoff(_ v:Double)->Double{3.5*pow(0.4/3.5,v)}
+    private static func steadinessFor(_ cutoff:Double)->Double{log(cutoff/3.5)/log(0.4/3.5)}
+    private func sliderRow(_ slider:NSSlider,_ label:String,_ left:String,_ right:String,_ value:NSTextField)->NSView{
+        slider.target=self;slider.action=#selector(extrasChanged(_:));slider.isContinuous=true;slider.setAccessibilityLabel(label)
+        value.font = .monospacedDigitSystemFont(ofSize:13,weight:.medium);value.setContentHuggingPriority(.required,for:.horizontal)
+        let ends=hmRow([rkLabel(left,12,.regular,.secondaryLabelColor)],trailing:[rkLabel(right,12,.regular,.secondaryLabelColor)])
+        let track=rkVStack([rkLabel(label,13,.medium),slider,ends],spacing:2,align:.leading)
+        ends.widthAnchor.constraint(equalTo:slider.widthAnchor).isActive=true
+        slider.widthAnchor.constraint(equalTo:track.widthAnchor).isActive=true
+        track.setHuggingPriority(.init(1),for:.horizontal)
+        let row=rkHStack([track,value],spacing:14);row.alignment = .centerY
+        return row
+    }
 
     init(home:AirPointerHome) {
         self.home=home
@@ -528,6 +557,10 @@ private final class SettingsPage:NSObject {
         back.setAccessibilityLabel("Back to Pointer")
         column.addFull(hmRow([back]));column.gap(4)
         column.addFull(rkLabel("Settings",22,.bold))
+        column.addHeader("General")
+        openAtLogin.setAccessibilityLabel("Open at login")
+        openAtLogin.onChange={[weak self] on in LoginItem.set(on);UserDefaults.standard.set(true,forKey:LoginItem.askedKey);self?.applyLogin()}
+        column.addFull(hmSettingRow("Open at login",detail:loginNote,openAtLogin))
         column.addHeader("AirPods")
         pairs.target=self;pairs.action=#selector(changed(_:));pairs.setAccessibilityLabel("AirPods to connect to")
         column.addFull(hmSettingRow("Connect to",nil,pairs))
@@ -545,6 +578,23 @@ private final class SettingsPage:NSObject {
         track.setHuggingPriority(.init(1),for:.horizontal)
         let slider=rkHStack([track,speedValue],spacing:14);slider.alignment = .top
         column.addFull(slider)
+        column.addHeader("Smoothness")
+        column.addFull(sliderRow(steadiness,"Steadiness when still","Quicker","Steadier",steadinessValue))
+        column.addFull(sliderRow(snappiness,"Fast moves","Smoother","Snappier",snappinessValue))
+        column.addFull(sliderRow(glide,"Glide","Off","Softer",glideValue))
+        let resetSmooth=RemoteButton("Reset",style:.secondary,height:28,target:self,action:#selector(resetSmoothing))
+        column.addFull(hmSettingRow("Smoothness defaults","Steadiness 1.2 Hz, fast moves 14, glide 30 ms.",resetSmooth))
+        column.addHeader("Right click")
+        backTap.setAccessibilityLabel("Tap the back of the case to right-click");backTap.onChange={[weak self] _ in self?.extrasChanged(nil)}
+        column.addFull(hmSettingRow("Tap the back of the case","Right-clicks. Holding Control while you tap the front also right-clicks.",backTap))
+        column.addFull(sliderRow(backFirmness,"Back tap firmness","Lighter taps","Ignore grip shifts",backFirmnessValue))
+        column.addHeader("Scroll")
+        twistScroll.setAccessibilityLabel("Twist to scroll");twistScroll.onChange={[weak self] _ in self?.extrasChanged(nil)}
+        column.addFull(hmSettingRow("Twist to scroll","Turn the case like a key, past about 15°. The pointer holds still while you scroll.",twistScroll))
+        column.addFull(sliderRow(scrollSpeed,"Scroll speed","Slower","Faster",scrollSpeedValue))
+        scrollDirection.addItems(withTitles:["Standard","Inverted"])
+        scrollDirection.target=self;scrollDirection.action=#selector(extrasChanged(_:));scrollDirection.setAccessibilityLabel("Scroll direction")
+        column.addFull(hmSettingRow("Scroll direction","Inverted swaps which way you twist to scroll up and which to scroll down.",scrollDirection))
         column.addHeader("Tap to click")
         clickSound.setAccessibilityLabel("Click sound");clickSound.onChange={[weak self] _ in self?.changed(nil)}
         column.addFull(hmSettingRow("Click sound","Plays on this Mac when a tap on the case clicks.",clickSound))
@@ -566,14 +616,38 @@ private final class SettingsPage:NSObject {
         if screens.itemTitles != state.screens{screens.removeAllItems();screens.addItems(withTitles:state.screens)}
         if screens.itemArray.indices.contains(state.screen){screens.selectItem(at:state.screen)}
         screens.isEnabled=state.screens.count>1
-        let pairTitles=state.pairs.isEmpty ? ["No AirPods Pro found"]:state.pair<0 ? ["Choose your AirPods"]+state.pairs:state.pairs
+        let pairTitles=state.pairs.isEmpty ? ["No supported AirPods found"]:state.pair<0 ? ["Choose your AirPods"]+state.pairs:state.pairs
         if pairs.itemTitles != pairTitles{pairs.removeAllItems();pairs.addItems(withTitles:pairTitles)}
         pairs.selectItem(at:max(0,state.pair));pairs.isEnabled=state.pairs.count>1
         speed.doubleValue=state.speed
         rkSetText(speedValue,String(format:"%.1f×",state.speed))
         speed.setAccessibilityValueDescription(String(format:"%.1f times normal speed",state.speed))
         clickSound.setOn(state.clickSound,animated:false)
+        applyExtras();applyLogin()
     }
+    private func applyExtras(){
+        let minCutoff=ClosedCasePointerFilter.tuning("smoothingMinCutoff",1.2,0.4...3.5)
+        let beta=ClosedCasePointerFilter.tuning("smoothingBeta",14,0...40),tau=ClosedCasePointerFilter.tuning("glideTime",0.03,0...0.1)
+        steadiness.doubleValue=Self.steadinessFor(minCutoff);snappiness.doubleValue=beta;glide.doubleValue=tau
+        rkSetText(steadinessValue,String(format:"%.1f Hz",minCutoff));rkSetText(snappinessValue,String(format:"%.0f",beta))
+        rkSetText(glideValue,tau<0.002 ? "Off":String(format:"%.0f ms",tau*1000))
+        backTap.setOn(PointerExtras.backTapRightClick,animated:false);twistScroll.setOn(PointerExtras.twistScroll,animated:false)
+        scrollDirection.selectItem(at:PointerExtras.scrollReverse ? 1:0)
+        scrollSpeed.doubleValue=PointerExtras.scrollSpeed;rkSetText(scrollSpeedValue,String(format:"%.1f×",PointerExtras.scrollSpeed))
+        backFirmness.doubleValue=PointerExtras.backTapFirmness;rkSetText(backFirmnessValue,String(format:"%.2f g",PointerExtras.backTapFirmness));backFirmness.isEnabled=backTap.isOn
+        scrollSpeed.isEnabled=twistScroll.isOn;scrollDirection.isEnabled=twistScroll.isOn
+    }
+    @objc private func extrasChanged(_ sender:Any?){
+        let d=UserDefaults.standard
+        d.set((Self.cutoff(steadiness.doubleValue)*10).rounded()/10,forKey:"smoothingMinCutoff")
+        d.set(snappiness.doubleValue.rounded(),forKey:"smoothingBeta")
+        d.set(glide.doubleValue<0.002 ? 0:(glide.doubleValue*1000).rounded()/1000,forKey:"glideTime")
+        d.set(backTap.isOn,forKey:"backTapRightClick");d.set(twistScroll.isOn,forKey:"twistScroll");d.set(scrollDirection.indexOfSelectedItem==1,forKey:"scrollReverse")
+        d.set((scrollSpeed.doubleValue*10).rounded()/10,forKey:"scrollSpeed")
+        d.set((backFirmness.doubleValue*100).rounded()/100,forKey:"backTapFirmness")
+        applyExtras()
+    }
+    @objc private func resetSmoothing(){PointerExtras.resetSmoothing();applyExtras()}
     @objc private func changed(_ sender:Any?) {
         var value=home.pointerSettings
         value.screen=max(0,screens.indexOfSelectedItem);value.speed=(speed.doubleValue*10).rounded()/10;value.clickSound=clickSound.isOn

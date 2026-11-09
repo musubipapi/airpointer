@@ -28,8 +28,13 @@ struct ClosedCaseTapDetector {
     fileprivate struct Sample{let t:Double;let a:SIMD3<Double>;let w:SIMD3<Double>}
     // The way a finger on the front pushes this case's sensor, learned in setup if it isn't tapDirection.
     var direction=Self.tapDirection
+    // How closely a spike must line up with direction. The back-tap detector accepts a little less, since a tap on
+    // the back of a hand-held case rarely pushes exactly opposite to one on the front.
+    var alignmentNeeded=Self.minimumAlignment
     private var recent:[Sample]=[],rotation:(t:Double,w:SIMD3<Double>)?
-    private var lastTap = -Double.infinity,tapPeak=0.0,runFrom = -Double.infinity,steadyUntil:Double?
+    // The sensor time of the last tap's impact spike, so two detectors can tell which push came first.
+    private(set) var lastTap = -Double.infinity
+    private var tapPeak=0.0,runFrom = -Double.infinity,steadyUntil:Double?
     // Jolts that didn't click, for the session log. The reader empties it.
     var ignored:[String]=[]
     private var lastIgnored = -Double.infinity,ignoredSize=0.0
@@ -70,7 +75,7 @@ struct ClosedCaseTapDetector {
         let spike=s.a-before.a,size=length(spike),along=(spike*direction).sum()
         if s.t-lastTap<=Self.peakWithin{tapPeak=max(tapPeak,along)}
         guard s.t-lastTap>=Self.fastRefractory,size>=Self.softJolt else{return events}
-        guard along>=size*Self.minimumAlignment else{
+        guard along>=size*alignmentNeeded else{
             // The rebound of any jolt points backwards, so only forward ones say anything about a tap.
             if size>=Self.jolt,along>0{ignore(s.t,size,String(format:"not on the front, alignment %.2f, jolt %.2f g",along/size,size))}
             return events

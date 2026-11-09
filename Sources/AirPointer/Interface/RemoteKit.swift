@@ -271,15 +271,27 @@ enum CaseStep:Equatable {case closed,opening,open,close,turn,point}
 
 // The lid frames and the upright pose share one camera, so every step draws
 // in the same rect and the case never jumps between them.
+// Two looks: the AirPods Pro case (Pro 1, 2 and 3 look alike from the front) and the
+// AirPods 3/4/5 case. The look follows the AirPods last chosen or connected.
 struct CaseStepArt {
+    enum Family:String{case pro,airpods}
     let lid:[NSImage]
     let front:NSImage
-    static let shared:CaseStepArt? = {
-        guard let resources=Bundle.main.resourceURL,
-              let front=NSImage(contentsOf:resources.appendingPathComponent("CaseFront.png")) else{return nil}
-        let lid=(0..<12).compactMap{NSImage(contentsOf:resources.appendingPathComponent(String(format:"CaseLid-%02d.png",$0)))}
-        return lid.count==12 ? CaseStepArt(lid:lid,front:front):nil
-    }()
+    static let familyKey="caseArtFamily"
+    static func family(productID:UInt16)->Family{[0x2013,0x2019,0x201B,0x2030].contains(productID) ? .airpods:.pro}
+    static func remember(productID:UInt16){UserDefaults.standard.set(family(productID:productID).rawValue,forKey:familyKey)}
+    static var family:Family{Family(rawValue:UserDefaults.standard.string(forKey:familyKey) ?? "") ?? .pro}
+    private static var loaded:[Family:CaseStepArt]=[:]
+    static func load(_ family:Family)->CaseStepArt?{
+        if let art=loaded[family]{return art}
+        guard let resources=Bundle.main.resourceURL else{return nil}
+        let prefix=family == .pro ? "Case":"CaseAirPods-"
+        guard let front=NSImage(contentsOf:resources.appendingPathComponent(prefix+"Front.png")) else{return family == .pro ? nil:load(.pro)}
+        let lid=(0..<12).compactMap{NSImage(contentsOf:resources.appendingPathComponent(String(format:prefix+"Lid-%02d.png",$0)))}
+        guard lid.count==12 else{return family == .pro ? nil:load(.pro)}
+        let art=CaseStepArt(lid:lid,front:front);loaded[family]=art;return art
+    }
+    static var shared:CaseStepArt?{load(family)}
 }
 
 // A progress ring: the track, then an arc from the top going clockwise.

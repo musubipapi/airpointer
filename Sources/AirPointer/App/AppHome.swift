@@ -200,7 +200,10 @@ extension App {
                 self.closedCalibrationDeclined=false;session.recalibrate()
                 if session.stage == .calibrating{self.presentClosedCalibration(session)}
             }
-            assistant.onFinish={ [weak self] in UserDefaults.standard.set(true,forKey:"setupComplete");self?.showHome() }
+            assistant.onFinish={ [weak self] in
+                UserDefaults.standard.set(true,forKey:"setupComplete");self?.showHome()
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.6){LoginItem.offerIfNeeded()}
+            }
             assistant.onLearnTap={ [weak self] in self?.learnTap() }
             assistant.onStopLearningTap={ [weak self] in self?.stopLearningTap() }
             assistant.onClose={ [weak self] in self?.closedCaseSession?.stopLearningTaps();self?.setup=nil }

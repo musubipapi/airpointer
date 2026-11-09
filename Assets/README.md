@@ -9,6 +9,8 @@ case images come from, and the README's images.
 | `CaseLid/lid.json` | The source hash, the camera, and the data for each frame | A record of how the frames were made |
 | `CaseFront.png` | The closed case, upright, with the light facing you | How the case looks when you point |
 | `CaseLid/lid-00.png` to `lid-11.png` | The lid going from open to closed | The connection steps |
+| `airpods-mid.usdz` | Apple's AirPods 5 AR model, unchanged | The source of the AirPods 3/4/5 case images |
+| `AirPodsCase/CaseFront.png`, `AirPodsCase/Lid/` | The same views of the AirPods 3/4/5 case | Shown instead when AirPods 3, 4 or 5 are chosen |
 | `TapClick/click.wav` | A mouse button going down and up (96 ms) | The sound of a tap that clicks |
 | `NotchShimmer.wav` | Air and two glass bells (652 ms) | The sound of the notch opening |
 | `AppIcon.icns` | AirPointer's mark: the closed case, upright, on a dark tile | The app icon |
@@ -22,6 +24,11 @@ The MIT License at the top of this project does not cover this folder.
   model and its materials. The images in `Readme/` include these renders.
   [Download it from Apple](https://www.apple.com/105/media/us/airpods-pro/2025/7acffb13-4adb-40b1-9393-8f1c99bc6c90/ar/airpods-pro.usdz),
   linked from the [AirPods Pro specs page](https://www.apple.com/airpods-pro/specs/).
+- The AirPods 3/4/5 case images are renders of Apple's AirPods 5 AR model,
+  [linked from the AirPods 5 page](https://www.apple.com/105/media/us/airpods-5/2026/1bae77a6-82ef-46c2-875f-571e880dbfe2/ar/airpods-mid.usdz).
+  Apple owns the model and its materials. AirPods Pro 1 and 2 use the Pro 3
+  images: Apple's older Pro models have no movable lid, and the cases look
+  alike from the front.
 - The two sounds use parts from cuelume, MIT license, (c) 2026 Daniel Belyi. See
   `TapClick/LICENSE-cuelume.txt`.
 
@@ -37,6 +44,10 @@ to change them. Run this command from the project folder. It writes to
 
 Then copy `work/case-renders/case-pointer.png` to `Assets/CaseFront.png`, and copy
 `work/case-renders/lid/*` to `Assets/CaseLid/`.
+
+For the AirPods 3/4/5 case, run `Scripts/render-airpods-case.py` the same way. It
+writes to `work/case-renders-airpods`; copy `case-pointer.png` to
+`Assets/AirPodsCase/CaseFront.png` and `lid/*` to `Assets/AirPodsCase/Lid/`.
 
 All the images use one camera, 12° above the front of the case, so the frames line
 up. `Scripts/seat-earbuds.py` moves the earbuds from Apple's display position into

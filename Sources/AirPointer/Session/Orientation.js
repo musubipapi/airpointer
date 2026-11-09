@@ -130,10 +130,20 @@ export class Grip {
    throw Error('Aim in a different direction. Return to center, then aim toward the top.');
   this[name]=axis;
  }
+ // Degrees of twist about the pointing axis (the axis square to both aim edges), for twist-to-scroll.
+ roll(q){
+  if(!this.center||!this.right||!this.up)return null;
+  const axis=cross(this.right,this.up),n=norm(axis);if(n<1e-9)return null;
+  return dot(this.relative(q),axis.map(x=>x/n))*180/Math.PI;
+ }
  point(q){
   if(!this.center||!this.right||!this.up)return null;
   const v=this.relative(q),r=this.right,u=this.up,rr=dot(r,r),uu=dot(u,u),ru=dot(r,u),d=rr*uu-ru*ru;
   const x=(dot(v,r)*uu-dot(v,u)*ru)/d,y=(dot(v,u)*rr-dot(v,r)*ru)/d;
-  return [Math.max(0,Math.min(1,.5+x/2)),Math.max(0,Math.min(1,.5-y/2))];
+  // Unclamped on purpose: the speed gain is applied to this before the caller
+  // clamps to the screen. Clamping here first would shrink the reachable area
+  // to the middle (speed) fraction of the screen at any speed below 1x.
+  // (From musubipapi/airpointer#9 by slibertiny.)
+  return [.5+x/2,.5-y/2];
  }
 }

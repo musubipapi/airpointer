@@ -2,6 +2,15 @@ import AppKit
 import ApplicationServices
 import Carbon
 
+// Applies the speed gain to an unclamped aim, then clamps to the screen.
+// The gain must scale the aim before clamping: scaling an already-clamped
+// value would make every speed below 1x unable to reach the screen edges.
+// (From musubipapi/airpointer#9 by slibertiny.)
+func pointerAim(_ point: [Double], speed: Double) -> CGPoint {
+    CGPoint(x: min(1, max(0, 0.5 + (point[0]-0.5)*speed)),
+            y: min(1, max(0, 0.5 + (point[1]-0.5)*speed)))
+}
+
 func screenPoint(_ normalized: CGPoint, bounds: CGRect) -> CGPoint {
     CGPoint(x: bounds.minX + 1 + normalized.x * (bounds.width - 2),
             y: bounds.minY + 1 + normalized.y * (bounds.height - 2))
@@ -25,6 +34,7 @@ final class App: NSObject, NSApplicationDelegate {
     // Paired AirPods Pro, refreshed when Settings opens.
     var closedCasePairs:[ClosedCaseAirPods]=[]
     var timer: Timer?
+    var quitSignalSources:[DispatchSourceSignal]=[]
     var homeMenuItems:[NSMenuItem]=[]
     var disconnectMenuItem:NSMenuItem?
     var home:AirPointerHome?
@@ -46,6 +56,7 @@ final class App: NSObject, NSApplicationDelegate {
         }
         CursorSize.shared.restore()
         AudioOutputGuard.shared.restoreAfterCrash()
+        installQuitSignalHandlers()
         setupMenu()
         installNotch()
         let stateTimer=Timer(timeInterval:0.08,repeats:true){[weak self] _ in self?.checkState()}
@@ -53,7 +64,7 @@ final class App: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         if needsSetup{showSetup()}
-        else{showHome()}
+        else{showHome();DispatchQueue.main.asyncAfter(deadline:.now()+0.8){LoginItem.offerIfNeeded()}}
     }
 
     @objc func recalibrate() {
@@ -150,6 +161,17 @@ final class App: NSObject, NSApplicationDelegate {
         sender.activate(ignoringOtherApps:true)
         return false
     }
+    // SIGTERM, SIGINT and SIGHUP (kill, Ctrl-C, a closing terminal) would end the app without applicationWillTerminate, leaving
+    // the cursor enlarged and the AirPods audio moved. Turn them into a normal quit so the same cleanup runs.
+    private func installQuitSignalHandlers() {
+        for number in [SIGTERM,SIGINT,SIGHUP] {
+            signal(number,SIG_IGN)
+            let source=DispatchSource.makeSignalSource(signal:number,queue:.main)
+            source.setEventHandler{NSApp.terminate(nil)}
+            source.resume()
+            quitSignalSources.append(source)
+        }
+    }
     func applicationWillTerminate(_ notification: Notification) {
         closedCaseSession?.shutdown()
         CursorSize.shared.restore()
@@ -162,7 +184,10 @@ final class App: NSObject, NSApplicationDelegate {
 @main
 struct AirPointerMain {
 static func main() {
-if CommandLine.arguments.contains("--check-audio-output-policy") {
+if CommandLine.arguments.contains("--unregister-login-item") {
+    // Used by the uninstall script to remove the login item before the app is deleted.
+    exit(LoginItem.set(false) ? 0:1)
+} else if CommandLine.arguments.contains("--check-audio-output-policy") {
     runAudioOutputPolicyChecks()
 } else if let index=CommandLine.arguments.firstIndex(of:"--check-closed-case-tap") {
     let fixtures=CommandLine.arguments.indices.contains(index+1) ? URL(fileURLWithPath:CommandLine.arguments[index+1]):nil
@@ -179,6 +204,15 @@ if CommandLine.arguments.contains("--check-audio-output-policy") {
     selfCheck(screenPoint(CGPoint(x: 0.5, y: 0.5), bounds: bounds) == CGPoint(x: -960, y: 540))
     selfCheck(screenPoint(.zero, bounds: bounds) == CGPoint(x: -1919, y: 1))
     selfCheck(screenPoint(CGPoint(x: 1, y: 1), bounds: bounds) == CGPoint(x: -1, y: 1079))
+    // Every speed must still reach all four edges, given enough rotation. (musubipapi/airpointer#9)
+    for speed in [0.4, 0.7, 1.0, 1.4, 2.4] {
+        let far = 0.5 + 0.5/speed
+        selfCheck(pointerAim([far, far], speed: speed) == CGPoint(x: 1, y: 1))
+        selfCheck(pointerAim([1-far, 1-far], speed: speed) == CGPoint(x: 0, y: 0))
+        selfCheck(pointerAim([0.5, 0.5], speed: speed) == CGPoint(x: 0.5, y: 0.5))
+    }
+    selfCheck(pointerAim([1, 1], speed: 0.7) == CGPoint(x: 0.85, y: 0.85))
+    selfCheck(pointerAim([1.8, 1.8], speed: 0.7) == CGPoint(x: 1, y: 1))
     runPoseChecks()
     do{try runPointerSettingsChecks()}catch{fputs("Pointer settings check failed: \(error.localizedDescription)\n",stderr);exit(1)}
     do{try runClosedCaseStageChecks()}catch{fputs("Closed-case stage check failed: \(error.localizedDescription)\n",stderr);exit(1)}

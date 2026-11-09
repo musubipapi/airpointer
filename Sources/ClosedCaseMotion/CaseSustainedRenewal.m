@@ -27,7 +27,7 @@
 //   30 BASELINE_UNAVAILABLE No fresh accelerometer+gyro within 15 s with the lid open. AirPods also
 //                           connected to an iPhone do this: setup answered, then no motion or UARP.
 //   31 IDENTITY_UNAVAILABLE The earbud never confirmed its identity (root Model/VERSION).
-//   32 WRONG_EARBUD_MODEL   The earbud's firmware ModelName is not AirPods Pro.
+//   32 WRONG_EARBUD_MODEL   The earbud's firmware ModelName is not an AirPods earbud.
 //   34 WRONG_CASE_MODEL     Endpoint 1's firmware ModelName is not an AirPods charging case.
 //   35 CASE_LOST            The case endpoint announced itself unreachable.
 //   36 CASE_DECLINED        The case refused or rejected the diagnostic (MTIC) request.
@@ -88,7 +88,7 @@ static const HelperExitInfo helperExitTable[]={
     {HelperExitNoSessionReply,"NO_SESSION_REPLY","AACP channel opened but nothing answered"},
     {HelperExitBaselineUnavailable,"BASELINE_UNAVAILABLE","no fresh open-lid motion"},
     {HelperExitIdentityUnavailable,"IDENTITY_UNAVAILABLE","earbud identity not confirmed"},
-    {HelperExitWrongEarbudModel,"WRONG_EARBUD_MODEL","earbud ModelName is not AirPods Pro"},
+    {HelperExitWrongEarbudModel,"WRONG_EARBUD_MODEL","earbud ModelName is not an AirPods earbud"},
     {HelperExitWrongCaseModel,"WRONG_CASE_MODEL","endpoint is not an AirPods charging case"},
     {HelperExitCaseLost,"CASE_LOST","charging case became unreachable"},
     {HelperExitCaseDeclined,"CASE_DECLINED","case declined the diagnostic request"},
@@ -403,11 +403,15 @@ static NSString *foldedModelName(NSString *name) {
 }
 static BOOL earbudModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods pro"] && ![folded containsString:@"case"];
+    // Any AirPods earbud with motion sensors (AirPods 3 and 4 answer "AirPods"; Pro models "AirPods Pro…").
+    // AirPods Max have no case, and the app's product list already leaves out models without a gyroscope.
+    return [folded hasPrefix:@"airpods"] && ![folded containsString:@"case"] && ![folded containsString:@"max"];
 }
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+    // AirPods Pro 2 (USB-C) cases name themselves e.g. "MagSafe Charging Case (USB-C)",
+    // without an "AirPods" prefix. Earbuds never contain "case", so this still tells them apart.
+    return ([folded hasPrefix:@"airpods"] || [folded hasPrefix:@"magsafe"]) && [folded containsString:@"charging case"];
 }
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
@@ -458,6 +462,9 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
 @property double nextActiveIdentityAt;
 @property NSUInteger identityRefreshReplies;
 @property NSUInteger missedReplies;
+// One resend per pending model or solicit request; its extra reply is ignored.
+@property BOOL resentPending,resending;
+@property NSUInteger outstandingSolicits,outstandingModels;
 @property NSUInteger caseVersionFrames,caseVersionReplies,caseInnerBytes,caseRequests,unconfirmedBytes;
 @property NSData *offer;
 @property NSData *solicitationDenial;
@@ -510,11 +517,12 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     if(requests>=requestLimit-1 || usedBytes+bytes+10>byteLimit ||
        self.unconfirmedBytes+bytes+((self.accepted || type==0x0d)?10:0)>112) return NO;
     if(type==0x14) return self.caseModelVerified && self.solicitationSent && !self.accepted && !self.cleanupStarted && !self.denialReceiptAttempted && self.solicitationDenial && [body isEqualToData:self.solicitationDenial] && body.length==6 && !memcmp(b,"MTIC",4);
-    if(self.cleanupStarted || self.error || self.pending) return NO;
+    if(self.cleanupStarted || self.error || (self.pending && !self.resending)) return NO;
     if(!self.caseModelVerified && self.caseInnerBytes+bytes>112) return NO;
     if(type==1) return !self.caseModelSent && self.caseVersionFrames<2 && body.length==2 && be16(b)==7;
-    if(type==3) return body.length==4 && be32(b)==2 && ((self.caseVersionValid && !self.caseModelSent) || self.accepted);
-    if(type==0x11) return self.caseModelVerified && [self initializedCaseRoute] && !self.offer && !self.accepted && [self maySolicitAt:NSProcessInfo.processInfo.systemUptime] && body.length==4 && !memcmp(b,"MTIC",4);
+    if(type==3) return body.length==4 && be32(b)==2 && (self.resending ? [self.pending isEqualToString:@"model"] && !self.caseModelVerified : ((self.caseVersionValid && !self.caseModelSent) || self.accepted));
+    if(type==0x11) return self.caseModelVerified && [self initializedCaseRoute] && !self.offer && !self.accepted && (self.resending ? [self.pending isEqualToString:@"solicit"] : [self maySolicitAt:NSProcessInfo.processInfo.systemUptime]) && body.length==4 && !memcmp(b,"MTIC",4);
+    if(self.resending) return NO;
     if(type==0x0d) return self.caseModelVerified && [self initializedCaseRoute] && self.offer && !self.receiptAttempted && [body isEqualToData:self.offer] && mticOffer(body)!=nil;
     return NO;
 }
@@ -522,9 +530,9 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     if(![self canSendChild:type body:body]) return NO;
     self.caseRequests++;self.caseInnerBytes+=body.length+6;self.unconfirmedBytes+=body.length+6;
     self.windowRequests++;self.windowBytes+=body.length+6;
-    if(type==1) self.caseVersionFrames++;if(type==3) {if(!self.caseModelVerified) self.modelSentAfterVersionFrames=self.caseVersionFrames;self.caseModelSent=YES;}
+    if(type==1) self.caseVersionFrames++;if(type==3) {if(!self.caseModelVerified) {self.modelSentAfterVersionFrames=self.caseVersionFrames;self.outstandingModels++;}self.caseModelSent=YES;}
     if(type==0x0d) {self.receiptAttempted=YES;self.assetID=[self.offerMetadata[@"asset_id"] unsignedIntValue];}
-    if(type==0x11) {self.solicitationAttempted=YES;self.solicitationAttempts++;self.solicitationReceiptVerified=NO;self.lastSolicitationAt=NSProcessInfo.processInfo.systemUptime;}
+    if(type==0x11) {self.outstandingSolicits++;self.solicitationAttempted=YES;self.solicitationAttempts++;self.solicitationReceiptVerified=NO;self.lastSolicitationAt=NSProcessInfo.processInfo.systemUptime;}
     if(type==0x14) self.denialReceiptAttempted=YES;
     if(type==9) self.cleanupSent=YES; // A partial write cannot authorize a second cleanup/retry.
     printf("CASE TX uptime=%.6f type=%u ID=%u bytes=%lu total_bytes=%lu\n",NSProcessInfo.processInfo.systemUptime,type,self.nextChildID,body.length+6,self.caseInnerBytes);
@@ -532,7 +540,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     uint8_t endpoint[]={0,1};NSMutableData *outer=[NSMutableData dataWithBytes:endpoint length:2];[outer appendData:uarpMessage(type,childID,body)];
     return sendUARPPacket(self.output,0x1b,rootID,outer);
 }
-- (void)setPending:(NSString *)kind at:(double)now {self.pending=kind;self.pendingSince=now;}
+- (void)setPending:(NSString *)kind at:(double)now {self.pending=kind;self.pendingSince=now;self.resentPending=NO;}
 - (void)acceptOfferIfReady {
     if(!self.caseModelVerified || ![self initializedCaseRoute] || !self.offer || self.receiptAttempted || self.pending || self.cleanupStarted || self.error) return;
     if([self sendChild:0x0d body:self.offer]) {self.accepted=YES;self.nextActiveIdentityAt=NSProcessInfo.processInfo.systemUptime+1;printf("CASE MTIC receipt ACK asset=%u length=%u; analytics may be consumed\n",self.assetID,[self.offerMetadata[@"asset_length"] unsignedIntValue]);}
@@ -581,8 +589,11 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
         self.cleanupAck=YES;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;return;
     }
     if(self.cleanupStarted) return;
-    if(it==0x12 && self.solicitationSent && [self.pending isEqualToString:@"solicit"]) {
+    if(it==0x12 && self.solicitationSent && ([self.pending isEqualToString:@"solicit"] || self.outstandingSolicits>0)) {
         if(in!=8 || be32(v)!=0 || memcmp(v+4,"MTIC",4)) {[self fail:(in==8 && !memcmp(v+4,"MTIC",4))?HelperExitCaseDeclined:HelperExitUnexpectedReply reason:@"case diagnostic request receipt was invalid or unsuccessful"];return;}
+        if(self.outstandingSolicits) self.outstandingSolicits--;
+        if(![self.pending isEqualToString:@"solicit"]) {puts("Late case diagnostic receipt ignored");return;}
+        // Either copy's reply answers the pending request; the other copy's reply, if any, is ignored.
         self.solicitationReceiptVerified=YES;self.solicitationReceipts++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
     } else if(it==0x13 && self.solicitationSent && !self.accepted) {
         if(in!=6 || memcmp(v,"MTIC",4)) {[self fail:HelperExitUnexpectedReply reason:@"invalid case diagnostic rejection"];return;}
@@ -601,8 +612,10 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     } else if(it==4 && self.caseModelSent && !self.caseModelVerified) {
         if((![self.pending isEqual:@"model"] || self.modelSentAfterVersionFrames!=self.caseVersionFrames)) {[self fail:HelperExitUnexpectedReply reason:@"case identity reply did not match the ordered setup query"];return;}
         self.caseIdentity=modelName(body);
-        if(!chargingCaseModelMatches(self.caseIdentity)) {[self fail:HelperExitWrongCaseModel reason:@"announced endpoint is not the exact case model"];return;}
-        self.caseModelVerified=YES;self.pending=nil;self.unconfirmedBytes=self.unconfirmedBytes>=10?self.unconfirmedBytes-10:0;
+        fprintf(stderr,"CASE MODEL NAME: \"%s\"\n",(self.caseIdentity?:@"(unreadable)").UTF8String);
+        if(!chargingCaseModelMatches(self.caseIdentity)) {[self fail:HelperExitWrongCaseModel reason:[NSString stringWithFormat:@"announced endpoint is not the exact case model (\"%@\")",self.caseIdentity?:@"(unreadable)"]];return;}
+        NSUInteger modelBytes=10*self.outstandingModels;self.outstandingModels=self.outstandingModels>1?self.outstandingModels-1:0;
+        self.caseModelVerified=YES;self.pending=nil;self.unconfirmedBytes=self.unconfirmedBytes>=modelBytes?self.unconfirmedBytes-modelBytes:0;
         self.caseRouteDrained=self.caseVersionReplies==self.caseVersionFrames;
         if(self.caseRouteDrained) self.unconfirmedBytes=0;
         else {
@@ -613,7 +626,8 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
         NSString *refreshed=modelName(body);
         if(!chargingCaseModelMatches(refreshed) || (self.caseIdentity.length && ![foldedModelName(refreshed) isEqualToString:foldedModelName(self.caseIdentity)])) {[self fail:HelperExitWrongCaseModel reason:@"case identity refresh did not match the identified case"];return;}
         self.identityRefreshReplies++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
-    } else if(it==4 && self.caseModelVerified && !self.pending) {
+    } else if(it==4 && self.caseModelVerified && (!self.pending || self.outstandingModels>0)) {
+        if(self.outstandingModels) self.outstandingModels--;
         puts("Late case identity reply ignored");
     } else [self fail:HelperExitUnexpectedReply reason:@"unexpected case response for pending request"];
 }
@@ -623,6 +637,18 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     if([self.pending isEqualToString:@"identity_refresh"] && now-self.pendingSince>=5) {
         self.missedReplies++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
         printf("Case identity reply missed (%lu so far); motion carries on\n",(unsigned long)self.missedReplies);return;
+    }
+    // Replies normally take about 0.1 s, and the case drops its stream after 3.5 s
+    // without a solicitation, so a late model or solicit request is sent once more.
+    if(([self.pending isEqualToString:@"model"] || [self.pending isEqualToString:@"solicit"]) && !self.resentPending && now-self.pendingSince>=1.2 && now-self.pendingSince<5) {
+        self.resentPending=YES;self.resending=YES;BOOL model=[self.pending isEqualToString:@"model"];
+        const uint8_t query[]={0,0,0,2},tag[]={'M','T','I','C'};
+        NSData *body=model?packet(query,4):packet(tag,4);uint16_t type=model?3:0x11;
+        BOOL allowed=[self canSendChild:type body:body],sent=allowed && [self sendChild:type body:body];
+        self.resending=NO;
+        printf("Case %s reply late; resent once (%s)\n",self.pending.UTF8String,sent?"sent":"not sent");
+        if(allowed && !sent) [self fail:HelperExitWriteFailed reason:@"case late-request resend write failed"];
+        return;
     }
     if(self.pending && now-self.pendingSince>=5) {[self fail:HelperExitReplyTimeout reason:[NSString stringWithFormat:@"case %@ response timed out",self.pending]];return;}
     if(self.rootModelSent && !self.rootVerified && now-self.rootModelSince>=8) {[self fail:HelperExitIdentityUnavailable reason:@"root Model response timed out"];return;}
@@ -1068,8 +1094,11 @@ static void hardeningChecks(void) {
 
     // Firmware ModelName matching: tolerant, but still tells the earbud from the case.
     check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
-    check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
+    check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods Max") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
+    check(earbudModelMatches(@"AirPods") && earbudModelMatches(@"AirPods 4") && earbudModelMatches(@"AirPods (3rd generation)"),@"earbud match accepts AirPods 3 and 4 names");
     check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
+    check(chargingCaseModelMatches(@"MagSafe Charging Case (USB-C)") && chargingCaseModelMatches(@" magsafe charging case "),@"case ModelName match accepts the AirPods Pro 2 USB-C MagSafe case");
+    check(!chargingCaseModelMatches(@"MagSafe Battery Pack") && !chargingCaseModelMatches(@"MagSafe"),@"case match rejects other MagSafe accessories (musubipapi/airpointer#9)");
     check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];
@@ -1327,7 +1356,47 @@ static int offlineSelfTest(void) {
     check(drain.error && !drain.solicitationAttempted && !drain.caseRequests,@"incomplete startup accounting times out without an MTIC request");
 
     CaseSnapshot *timeout=testSession();timeout.pending=@"solicit";timeout.pendingSince=10;[timeout tick:14.99];
-    check(!timeout.error,@"request survives before five-second boundary");[timeout tick:15];check(timeout.error!=nil,@"five-second deadline stops without retry");
+    check(!timeout.error,@"request survives before five-second boundary");[timeout tick:15];check(timeout.error!=nil,@"five-second deadline stops when no resend can go out");
+    // Some cases (seen on AirPods Pro 2) sometimes drop one reply on an otherwise healthy 1 s cadence.
+    const uint8_t lateReceipt[]={0,0,0,0,'M','T','I','C'};
+    CaseSnapshot *resend=testSession();[resend.announced addObject:@1];resend.caseActive=YES;resend.caseModelVerified=YES;resend.caseRouteDrained=YES;
+    [resend tick:10];[resend tick:11];
+    check(resend.caseRequests==1 && [resend.pending isEqual:@"solicit"],@"no solicitation resend before the late-reply boundary");
+    [resend tick:11.3];[resend tick:12];[resend tick:13];
+    check(resend.caseRequests==2 && [resend.pending isEqual:@"solicit"] && !resend.error,@"one late solicitation is resent exactly once");
+    [resend handleMessage:testChild(0x12,60,packet(lateReceipt,8))];
+    check(!resend.pending && resend.solicitationReceiptVerified && !resend.error,@"either receipt answers a resent solicitation");
+    [resend handleMessage:testChild(0x12,61,packet(lateReceipt,8))];
+    check(!resend.error && resend.solicitationReceipts==1,@"the second receipt of a resent solicitation is ignored");
+    CaseSnapshot *resendLost=testSession();[resendLost.announced addObject:@1];resendLost.caseActive=YES;resendLost.caseModelVerified=YES;resendLost.caseRouteDrained=YES;
+    [resendLost tick:10];[resendLost tick:11.3];[resendLost tick:14.99];check(!resendLost.error,@"resent solicitation keeps the original deadline");
+    [resendLost tick:15];check(resendLost.failure==HelperExitReplyTimeout && resendLost.caseRequests==2,@"an unanswered resend still times out at five seconds");
+    CaseSnapshot *modelResend=testSession();[modelResend.announced addObject:@1];modelResend.caseActive=YES;modelResend.caseVersionValid=YES;modelResend.caseVersionFrames=1;modelResend.caseVersionReplies=1;
+    [modelResend tick:10];[modelResend tick:11.3];[modelResend tick:12];
+    check(modelResend.caseRequests==2 && [modelResend.pending isEqual:@"model"] && !modelResend.error,@"one late case Model query is resent exactly once");
+    [modelResend handleMessage:testChild(4,62,testModel(@"AirPods Charging Case"))];
+    check(modelResend.caseModelVerified && modelResend.caseRouteDrained && !modelResend.unconfirmedBytes && !modelResend.error,@"a reply to a resent Model query identifies the case");
+    [modelResend tick:12.1];check([modelResend.pending isEqual:@"solicit"],@"identification after a resend proceeds to solicitation");
+    [modelResend handleMessage:testChild(4,63,testModel(@"AirPods Charging Case"))];
+    check(!modelResend.error && [modelResend.pending isEqual:@"solicit"],@"the second reply to a resent Model query is ignored");
+    CaseSnapshot *strayModel=testSession();[strayModel.announced addObject:@1];strayModel.caseActive=YES;strayModel.caseModelVerified=YES;strayModel.caseRouteDrained=YES;[strayModel tick:10];
+    [strayModel handleMessage:testChild(4,64,testModel(@"AirPods Charging Case"))];
+    check(strayModel.failure==HelperExitUnexpectedReply,@"an identity reply nobody resent still fails during solicitation");
+    CaseSnapshot *dupDecline=testSession();[dupDecline.announced addObject:@1];dupDecline.caseActive=YES;dupDecline.caseModelVerified=YES;dupDecline.caseRouteDrained=YES;
+    [dupDecline tick:10];[dupDecline tick:11.3];[dupDecline handleMessage:testChild(0x12,920,packet(lateReceipt,8))];
+    const uint8_t declinedReceipt[]={0,0,0,1,'M','T','I','C'};[dupDecline handleMessage:testChild(0x12,921,packet(declinedReceipt,8))];
+    check(dupDecline.failure==HelperExitCaseDeclined,@"a declined duplicate receipt still stops the session");
+    CaseSnapshot *offerFirst=testSession();[offerFirst.announced addObject:@1];offerFirst.caseActive=YES;offerFirst.caseModelVerified=YES;offerFirst.caseRouteDrained=YES;
+    [offerFirst tick:10];[offerFirst handleMessage:testChild(5,930,testOffer(7,35))];[offerFirst tick:11.3];
+    check(offerFirst.caseRequests==1 && offerFirst.outstandingSolicits==1,@"an offer blocks the solicitation resend");
+    const uint8_t gapVersion[]={0,0,0,6,0,0};
+    CaseSnapshot *gapResend=testSession();[gapResend.announced addObject:@1];gapResend.caseActive=YES;[gapResend tick:0];[gapResend tick:8.1];[gapResend tick:16.2];
+    [gapResend handleMessage:testChild(2,940,packet(gapVersion,6))];[gapResend tick:16.3];[gapResend tick:17.6];
+    [gapResend handleMessage:testChild(4,941,testModel(@"AirPods Charging Case"))];
+    check([gapResend initializedCaseRoute] && gapResend.startupUnknownBytes==8 && gapResend.unconfirmedBytes==8 && !gapResend.error,@"a Model resend keeps the one-missing-VERSION accounting");
+    CaseSnapshot *brokenResend=testSession();[brokenResend.announced addObject:@1];brokenResend.caseActive=YES;brokenResend.caseModelVerified=YES;brokenResend.caseRouteDrained=YES;
+    [brokenResend tick:10];[brokenResend.output close];[brokenResend tick:11.3];
+    check(brokenResend.failure==HelperExitWriteFailed,@"a failed resend write stops the session");
     CaseSnapshot *budget=testSession();[budget.announced addObject:@1];budget.caseActive=YES;budget.caseInnerBytes=105;
     check(![budget canSendChild:1 body:packet(version,2)],@"unverified lifetime byte budget enforced");
     budget.caseInnerBytes=0;budget.unconfirmedBytes=105;check(![budget canSendChild:1 body:packet(version,2)],@"unconfirmed ring budget enforced");
